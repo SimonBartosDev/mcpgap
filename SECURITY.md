@@ -31,6 +31,14 @@ say so prominently and we will treat it accordingly.
 mcpgap executes untrusted third-party code by design. Its safety rests on the platform sandbox, not
 on the good behaviour of the code under test.
 
+**The preload shim is not a security boundary.** `src/mcpgap/observers/shim.cjs` is injected into the
+package's own process to record filesystem reads and subprocess spawns. It is an observation aid and
+nothing more: code under test can unhook it, keep a reference captured before it patched, or reach
+the kernel through a native addon. It is not relied on for containment, and no finding it fails to
+produce is treated as evidence of absence. Filesystem *writes* are established independently by
+hashing the sandbox's writable tree, which the package cannot evade — the sandbox refuses writes
+anywhere else.
+
 **What the sandbox is asserted to prevent**, with a regression test for each:
 
 - reading anything under `/Users` or `/Volumes` — the whole user namespace, which covers

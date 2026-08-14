@@ -16,14 +16,24 @@ run happened first.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from mcpgap.mcpclient import HandshakeError, McpError, StdioMcpClient
-from mcpgap.model import ObservedRequest, ToolObservation, VersionObservation
+from mcpgap.model import (
+    FileChanges,
+    FileEvent,
+    ObservedRequest,
+    ProcessEvent,
+    ToolObservation,
+    VersionObservation,
+)
 from mcpgap.normalize import SuppressionLog, normalise_headers
+from mcpgap.observers import diff_snapshots, install_shim, read_events, snapshot
+from mcpgap.observers.events import shim_path
 from mcpgap.probes import DEFAULT_SEED, arguments_for, nonce
 from mcpgap.proxy import SealedProxy
 from mcpgap.sandbox import SeatbeltSandbox
@@ -116,6 +126,82 @@ def _request_key(request: ObservedRequest, log: SuppressionLog | None = None) ->
     )
 
 
+#  node_modules is excluded from filesystem snapshots. That loses nothing: it
+#  is shared read-only from the install directory, which sits outside the
+#  sandbox's writable tree, so the package cannot write there in the first
+#  place. Hashing it would add thousands of files per snapshot for no signal.
+_SNAPSHOT_SKIP = frozenset({"node_modules"})
+
+
+def _stage_package(package_root: Path, run_dir: Path) -> Path:
+    """Give the run its own writable copy of the package.
+
+    Two reasons. Filesystem observation needs the package's own directory to be
+    writable, and it is not: the sandbox permits writes only under the run
+    directory. And a fresh copy per run keeps runs independent, so the N-runs
+    agreement check compares three genuinely separate executions rather than
+    three passes over one accumulating directory.
+
+    `node_modules` is shared by symlink rather than copied -- it is large, and
+    it stays read-only, which is what we want.
+    """
+    staged = run_dir / "package"
+    staged.mkdir(parents=True, exist_ok=True)
+    for entry in package_root.iterdir():
+        if entry.name == "node_modules":
+            continue
+        target = staged / entry.name
+        if entry.is_dir():
+            shutil.copytree(entry, target, dirs_exist_ok=True, symlinks=True)
+        else:
+            shutil.copy2(entry, target)
+    modules = package_root / "node_modules"
+    link = staged / "node_modules"
+    if modules.is_dir() and not link.exists():
+        link.symlink_to(modules, target_is_directory=True)
+    return staged
+
+
+def _relativise(text: str, workdir: Path) -> str:
+    """Rewrite run-specific absolute paths to a stable placeholder.
+
+    Every run gets a fresh temporary directory, and the two versions being
+    compared get different ones again. Left raw, an absolute path would differ
+    across every run and every version, so all three runs would disagree and
+    every tool would be reported UNSTABLE -- an artefact of our own plumbing
+    presented as a finding about the package.
+    """
+    for root in (str(workdir.resolve()), str(workdir)):
+        text = text.replace(root, "<run>")
+    return text
+
+
+def _normalise_events(
+    files: list[FileEvent], procs: list[ProcessEvent], workdir: Path
+) -> tuple[tuple[FileEvent, ...], tuple[ProcessEvent, ...]]:
+    return (
+        tuple(FileEvent(op=e.op, path=_relativise(e.path, workdir)) for e in files),
+        tuple(
+            ProcessEvent(op=e.op, argv=tuple(_relativise(a, workdir) for a in e.argv))
+            for e in procs
+        ),
+    )
+
+
+def _observation_key(observation: ToolObservation) -> str:
+    """Everything that must agree across runs before a verdict is issued."""
+    return json.dumps(
+        {
+            "requests": sorted(_request_key(r) for r in observation.requests),
+            "files": sorted(f"{e.op}:{e.path}" for e in observation.file_events),
+            "procs": sorted(" ".join(e.argv) for e in observation.process_events),
+            "changes": sorted(observation.file_changes.as_set()),
+            "error": observation.error is not None,
+        },
+        sort_keys=True,
+    )
+
+
 def _single_run(
     package_root: Path,
     workdir: Path,
@@ -126,12 +212,27 @@ def _single_run(
     sandbox = SeatbeltSandbox()
     node = _node_binary()
     config = declared_config(package_root, seed)
+    staged = _stage_package(package_root, workdir)
+    _, events_log = install_shim(workdir)
+    event_cursor = 0
 
     with SealedProxy(workdir) as proxy:
-        env = sandbox.child_env(workdir, {**config, **proxy.child_env()})
+        env = sandbox.child_env(
+            workdir,
+            {
+                **config,
+                **proxy.child_env(),
+                "MCPGAP_EVENTS": str(events_log),
+            },
+        )
+        # The shim must load before the package's entry point so that ESM named
+        # imports of builtins resolve to the patched functions.
+        existing = env.get("NODE_OPTIONS", "")
+        env["NODE_OPTIONS"] = f"{existing} --require {shim_path(workdir)}".strip()
+
         process = sandbox.spawn(
             [str(node), "index.js"],
-            cwd=package_root,
+            cwd=staged,
             env=env,
             workdir=workdir,
             allow_tcp_port=proxy.port,
@@ -143,6 +244,10 @@ def _single_run(
             declared = client.list_tools()
             per_tool: dict[str, ToolObservation] = {}
             arguments: dict[str, dict[str, Any]] = {}
+            # Baseline taken after startup, so module loading is not attributed
+            # to whichever tool happens to be called first.
+            _, _, event_cursor = read_events(events_log, 0)
+            fs_before = snapshot(workdir, skip_dirs=_SNAPSHOT_SKIP)
 
             for name, spec in declared.items():
                 schema = spec.get("inputSchema") or {}
@@ -161,10 +266,20 @@ def _single_run(
                         client.call_tool(name, args)
                     except McpError as retry_exc:
                         error = f"{exc} | required-only retry: {retry_exc}"
+
+                raw_files, raw_procs, event_cursor = read_events(events_log, event_cursor)
+                file_events, process_events = _normalise_events(raw_files, raw_procs, workdir)
+                fs_after = snapshot(workdir, skip_dirs=_SNAPSHOT_SKIP)
+                created, modified, deleted = diff_snapshots(fs_before, fs_after)
+                fs_before = fs_after
+
                 arguments[name] = args
                 per_tool[name] = ToolObservation(
                     tool=name,
                     requests=tuple(proxy.requests[before:]),
+                    file_events=tuple(file_events),
+                    process_events=tuple(process_events),
+                    file_changes=FileChanges(created, modified, deleted),
                     error=error,
                 )
             return RunResult(declared, per_tool, arguments)
@@ -220,9 +335,7 @@ def observe_version(
 
     for name in declared:
         keys = [
-            tuple(sorted(_request_key(r) for r in result.per_tool[name].requests))
-            for result in results
-            if name in result.per_tool
+            _observation_key(result.per_tool[name]) for result in results if name in result.per_tool
         ]
         if len(keys) != len(results) or len(set(keys)) > 1:
             unstable.add(name)

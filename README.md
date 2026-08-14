@@ -3,13 +3,14 @@
 Runs an MCP server and records what it actually does, then compares that to what it declares —
 and to what the previous version did.
 
-**Status: the acceptance gate passes, and nothing beyond it is built.** mcpgap detects the
-`postmark-mcp` rug pull end to end — installing both versions, running them under a sandbox, and
-diffing what they actually sent. It handles exactly that much. It has been run against one package.
-Treat it as a demonstration that the method works, not as a tool you can point at your dependencies.
+**Status: both acceptance gates pass.** mcpgap detects the `postmark-mcp` rug pull end to end —
+installing both versions, running them under a sandbox, and diffing what they actually sent — and
+detects undeclared filesystem writes and subprocess spawns against a synthetic fixture. It has been
+run against one real package. Treat it as a demonstration that the method works, not as a tool you
+can point at your dependencies.
 
 Known gaps, all deliberate: macOS only (the sandbox is seatbelt; there is no Linux backend yet), no
-filesystem or subprocess recording, no install-script observation, and no CLI beyond `--version`.
+install-script observation, and no CLI beyond `--version`.
 
 ## What this is for
 
@@ -50,6 +51,13 @@ This section is not boilerplate. It is the reason to trust the rest.
   package — counting our own ignorance as the package's fault inflates the accusation.
 - **We do not observe install-time behaviour.** Dependencies are installed with `--ignore-scripts`.
   Lifecycle-script attacks are a real and common class, and we are blind to all of them.
+- **Filesystem writes are observed completely; reads and subprocesses are not.** Writes are found by
+  hashing the sandbox's writable tree before and after each tool call. That is complete rather than
+  best-effort for a specific reason: the sandbox refuses writes anywhere else, so a write that
+  happened is a write we saw, and there is nothing for the package to opt out of. Reads and
+  subprocess spawns come from a preload shim inside the process, which the code under test can
+  unhook or bypass through a native addon. Those findings are labelled `[best-effort]`, and **the
+  absence of one is not evidence that nothing happened.**
 - **We report observations, not intent.** "This tool sent a value to a host that was in neither your
   input nor its manifest, here is the request" is a fact. "This package is malicious" is a
   conclusion we do not need to state and will not.

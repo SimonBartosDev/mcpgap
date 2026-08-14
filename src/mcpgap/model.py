@@ -80,12 +80,63 @@ class BlockedConnection:
 
 
 @dataclass(frozen=True, slots=True)
+class FileEvent:
+    """A filesystem operation seen by the preload shim.
+
+    Best-effort: the shim is cooperative and can be bypassed. Writes have an
+    independent, non-bypassable witness in `FileChanges` below; reads do not,
+    and that asymmetry is deliberate rather than an oversight.
+    """
+
+    op: str
+    path: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessEvent:
+    """A subprocess spawn seen by the preload shim. Best-effort, as above."""
+
+    op: str
+    argv: tuple[str, ...]
+
+    @property
+    def command(self) -> str:
+        return self.argv[0] if self.argv else ""
+
+
+@dataclass(frozen=True, slots=True)
+class FileChanges:
+    """Files created, modified or deleted in the sandbox's writable tree.
+
+    Complete, not best-effort: the sandbox refuses writes outside this tree, so
+    anything written at all is written here and shows up in the snapshot diff.
+    """
+
+    created: tuple[str, ...] = ()
+    modified: tuple[str, ...] = ()
+    deleted: tuple[str, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.created or self.modified or self.deleted)
+
+    def as_set(self) -> frozenset[tuple[str, str]]:
+        return frozenset(
+            [("created", p) for p in self.created]
+            + [("modified", p) for p in self.modified]
+            + [("deleted", p) for p in self.deleted]
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ToolObservation:
     """What one tool did, across one run."""
 
     tool: str
     requests: tuple[ObservedRequest, ...] = ()
     blocked: tuple[BlockedConnection, ...] = ()
+    file_events: tuple[FileEvent, ...] = ()
+    process_events: tuple[ProcessEvent, ...] = ()
+    file_changes: FileChanges = FileChanges()
     error: str | None = None
 
     @property
@@ -134,17 +185,28 @@ class Finding:
 
     tool: str
     kind: str
-    host: str
-    path: str
-    pointer: str
     value: Any
-    attribution: Attribution
-    evidence: ObservedRequest
+    attribution: Attribution = Attribution.UNATTRIBUTED
+    # Network findings carry the request they were found in. Filesystem and
+    # subprocess findings have no request, so this is None for them and the
+    # fact lives in `value`.
+    host: str = ""
+    path: str = ""
+    pointer: str = ""
+    evidence: ObservedRequest | None = None
+    # Whether the mechanism that produced this finding can be evaded by the
+    # code under test. Snapshot-derived filesystem writes cannot; anything from
+    # the cooperative preload shim can. Reported, never silently averaged in.
+    best_effort: bool = False
 
     def describe(self) -> str:
+        qualifier = " [best-effort]" if self.best_effort else ""
+        if self.evidence is None:
+            return f"{self.tool}: {self.kind} -- {self.value!r}{qualifier}"
         return (
             f"{self.tool}: {self.kind} at {self.pointer} in request to "
-            f"{self.host}{self.path} -- value {self.value!r} ({self.attribution})"
+            f"{self.host}{self.path} -- value {self.value!r} "
+            f"({self.attribution}){qualifier}"
         )
 
 

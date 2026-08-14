@@ -29,6 +29,7 @@ from mcpgap.model import (
     DiffReport,
     Finding,
     ObservedRequest,
+    ToolObservation,
     Verdict,
     VersionObservation,
 )
@@ -148,12 +149,19 @@ def diff_versions(
         tool_findings = list(
             _diff_tool(tool, old_obs.requests, new_obs.requests, caller_tokens, config_tokens)
         )
+        tool_findings += list(_diff_side_effects(tool, old_obs, new_obs, caller_tokens))
         findings.extend(tool_findings)
-        verdicts[tool] = (
-            Verdict.UNDECLARED_BEHAVIOUR
-            if any(f.attribution is Attribution.UNATTRIBUTED for f in tool_findings)
-            else Verdict.CONSISTENT
-        )
+
+        # Network findings only count against the package when the value cannot
+        # be traced to something we supplied. Filesystem and subprocess findings
+        # are already differential -- the same inputs produced an effect in one
+        # version and not the other -- so there is nothing further to attribute.
+        implicating = [
+            f
+            for f in tool_findings
+            if f.evidence is None or f.attribution is Attribution.UNATTRIBUTED
+        ]
+        verdicts[tool] = Verdict.UNDECLARED_BEHAVIOUR if implicating else Verdict.CONSISTENT
 
     def _schemas(observation: VersionObservation) -> dict[str, str]:
         return {
@@ -180,6 +188,76 @@ def diff_versions(
         destinations_added=new.destinations() - old.destinations(),
         destinations_removed=old.destinations() - new.destinations(),
     )
+
+
+# Shim operations that read rather than write. Writes are deliberately not
+# taken from the shim: they have a complete, non-bypassable witness in the
+# snapshot diff, and reporting both would double-count every write.
+_READ_OPS = frozenset(
+    {
+        "readFileSync",
+        "readFile",
+        "promises.readFile",
+        "readdirSync",
+        "readdir",
+        "promises.readdir",
+        "createReadStream",
+        "openSync",
+        "open",
+        "promises.open",
+    }
+)
+
+
+def _diff_side_effects(
+    tool: str,
+    old: ToolObservation,
+    new: ToolObservation,
+    caller_tokens: set[str],
+) -> Iterator[Finding]:
+    """Report filesystem and subprocess effects present in `new` but not `old`.
+
+    These need no attribution step. The two versions were driven with identical
+    inputs, so an effect that appears in one and not the other is a difference
+    in the code, not a difference in what we asked for. A file the caller asked
+    for is written by both versions and therefore never shows up here.
+    """
+    for kind, paths in (
+        ("file_created", set(new.file_changes.created) - set(old.file_changes.created)),
+        ("file_modified", set(new.file_changes.modified) - set(old.file_changes.modified)),
+        ("file_deleted", set(new.file_changes.deleted) - set(old.file_changes.deleted)),
+    ):
+        for path in sorted(paths):
+            yield Finding(
+                tool=tool,
+                kind=kind,
+                value=path,
+                attribution=attribute(path, caller_tokens, set()),
+                # Complete: the sandbox confines writes to the tree we snapshot,
+                # so a write that happened is a write we saw.
+                best_effort=False,
+            )
+
+    old_spawns = {" ".join(e.argv) for e in old.process_events}
+    for spawn in sorted({" ".join(e.argv) for e in new.process_events} - old_spawns):
+        yield Finding(
+            tool=tool,
+            kind="process_spawned",
+            value=spawn,
+            attribution=attribute(spawn, caller_tokens, set()),
+            best_effort=True,
+        )
+
+    old_reads = {e.path for e in old.file_events if e.op in _READ_OPS}
+    new_reads = {e.path for e in new.file_events if e.op in _READ_OPS}
+    for path in sorted(new_reads - old_reads):
+        yield Finding(
+            tool=tool,
+            kind="file_read",
+            value=path,
+            attribution=attribute(path, caller_tokens, set()),
+            best_effort=True,
+        )
 
 
 def _diff_tool(

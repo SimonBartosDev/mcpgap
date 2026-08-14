@@ -17,8 +17,10 @@ workdir/
 runs/
 *.sbom.json
 
-# Fixtures are committed ONLY as password-protected archives. An unpacked
-# fixture tree is live malware and is never tracked.
-fixtures/**/unpacked/
-fixtures/**/*.js
-!fixtures/**/PROVENANCE.md
+# The top-level fixtures/ directory is the malware corpus. It is committed ONLY
+# as password-protected archives; an unpacked tree there is live malware and is
+# never tracked. Anchored with a leading slash so it cannot match the benign
+# synthetic servers under tests/fixtures/.
+/fixtures/**/unpacked/
+/fixtures/**/*.js
+!/fixtures/**/PROVENANCE.md
