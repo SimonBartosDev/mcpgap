@@ -143,7 +143,9 @@ def test_side_effect_diff_reports_reads_but_not_writes_from_the_shim() -> None:
         "t",
         file_events=(
             FileEvent(op="readFileSync", path="/etc/hosts"),
-            FileEvent(op="writeFileSync", path="/tmp/out"),
+            # S108: an inert string in a recorded event, not a path this test
+            # opens. Nothing here touches the filesystem.
+            FileEvent(op="writeFileSync", path="/tmp/out"),  # noqa: S108
         ),
     )
     findings = list(_diff_side_effects("t", _obs("t"), new, caller_tokens=set()))
