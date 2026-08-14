@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # pip-audit and CodeQL are only useful if they run against a moving advisory
+    # database, not just when we happen to push.
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Actions are pinned by commit SHA, not tag. A tag is mutable and this is a
+  # security tool; the trailing comment records which release each SHA was.
+  UV_FROZEN: "1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups
+      - run: uv run ruff check --output-format=github .
+      - run: uv run ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups
+      # Linux has no seatbelt backend, so sandbox-marked tests cannot run here.
+      # They are not skipped silently: the `sandbox` job below is a required
+      # check, and it fails if it does not actually execute them.
+      - run: uv run pytest -v -m "not sandbox and not network"
+
+  sandbox:
+    # The acceptance gate runs the real sandbox. If this job is skipped,
+    # cancelled, or its tests are deselected, the gate has NOT been verified.
+    # `--strict-markers` plus the guard step below make that a failure rather
+    # than a green tick.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups
+      - name: Run sandbox-dependent tests
+        run: uv run pytest -v -m "sandbox" --junitxml=sandbox-results.xml
+      - name: Fail if no sandbox test actually ran
+        # A pytest run that selects zero tests exits 5, but a marker typo or a
+        # collection error upstream can still leave us with an empty-but-green
+        # result. Assert positively that tests executed.
+        run: |
+          python3 - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse("sandbox-results.xml").getroot()
+          suites = root.iter("testsuite")
+          total = sum(int(s.get("tests", 0)) for s in suites)
+          if total == 0:
+              sys.exit("No sandbox tests ran. The gate is unverified; failing.")
+          print(f"{total} sandbox tests ran.")
+          PY
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups
+      - name: pip-audit
+        # Audit the locked, hash-pinned requirements rather than the live
+        # environment. Auditing the environment would force a choice between
+        # --strict and skipping mcpgap itself (editable, not on PyPI); exporting
+        # first drops only our own package and keeps --strict meaningful, so an
+        # unauditable dependency fails the build instead of being reported and
+        # ignored.
+        run: |
+          uv export --all-groups --no-emit-project --format requirements-txt -o requirements.audit.txt
+          uv run pip-audit -r requirements.audit.txt --strict --progress-spinner=off
+      - name: bandit
+        run: uv run bandit -c pyproject.toml -r src/ -ll
+
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups
+      - run: uv run cyclonedx-py environment --output-format json --output-file mcpgap.sbom.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom
+          path: mcpgap.sbom.json
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  codeql:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: github/codeql-action/init@c16c0f3f2812ec4bb3750a5ed64873fe2ce0fbef # codeql-bundle-v2.26.3
+        with:
+          languages: python
+          queries: security-extended
+      - uses: github/codeql-action/analyze@c16c0f3f2812ec4bb3750a5ed64873fe2ce0fbef # codeql-bundle-v2.26.3

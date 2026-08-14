@@ -1,0 +1,69 @@
+[project]
+name = "mcpgap"
+version = "0.0.1"
+description = "Detects the gap between what an MCP server declares and what it actually does, across versions."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.13"
+
+# Kept deliberately small. This tool executes untrusted package code on purpose,
+# so every dependency we add is attack surface we also have to vouch for.
+# `cryptography` is here to mint the sealed proxy's leaf certificates; there is
+# no third-party HTTP, proxy, or MCP-client dependency by design.
+dependencies = [
+    "cryptography>=44",
+]
+
+[project.scripts]
+mcpgap = "mcpgap.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.9",
+    "pip-audit>=2.7",
+    "bandit>=1.8",
+    "cyclonedx-bom>=5",
+    # Used only by tools/build_fixtures.py. The macOS framework Python ships
+    # without a usable CA bundle, so the fixture builder cannot verify TLS
+    # against the system store. Declared explicitly rather than relied on as a
+    # transitive dependency of pip-audit.
+    "certifi>=2024.7.4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcpgap"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "S"]
+# S603/S607: we spawn subprocesses as the entire point of the tool. Those calls
+# are reviewed individually and carry their own justification comments.
+ignore = ["S603", "S607"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert on hardcoded fixture values, including the known attacker address.
+"tests/**" = ["S101", "S105", "S106"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# An unknown marker must be an error, not a warning: a typo in `-m sandbox`
+# would otherwise silently select zero tests and report success.
+addopts = "--strict-markers"
+markers = [
+    "sandbox: requires a working platform sandbox (macOS seatbelt). Never silently skipped.",
+    "network: reaches third-party archives; excluded from the hermetic default run.",
+]
+# Fail on unknown markers and on tests that pass while raising warnings we care about.
+filterwarnings = ["error::DeprecationWarning:mcpgap.*"]
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv", "fixtures"]
