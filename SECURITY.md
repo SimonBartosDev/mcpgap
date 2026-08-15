@@ -31,6 +31,13 @@ say so prominently and we will treat it accordingly.
 mcpgap executes untrusted third-party code by design. Its safety rests on the platform sandbox, not
 on the good behaviour of the code under test.
 
+**mcpgap deliberately executes install scripts.** Lifecycle hooks (`preinstall`, `install`,
+`postinstall`, and `prepare` for the root package) are run so their behaviour can be recorded. This
+is the only code mcpgap runs that no tool call asked for, and it is precisely the code most likely
+to be hostile, so it runs under the same sandbox as everything else: no network but the recording
+proxy, writes confined to the run directory, no ambient credentials, and a timeout. If you do not
+want install scripts executed at all, do not run mcpgap on the package.
+
 **The preload shim is not a security boundary.** `src/mcpgap/observers/shim.cjs` is injected into the
 package's own process to record filesystem reads and subprocess spawns. It is an observation aid and
 nothing more: code under test can unhook it, keep a reference captured before it patched, or reach
@@ -64,8 +71,9 @@ paths, and only a test that checked the denial would have caught it.
 - Local resource exhaustion. There are no CPU or memory limits yet.
 - Kernel-level escapes from macOS seatbelt. This is a sandbox, not a virtual machine. On a machine
   holding data you cannot afford to lose, run mcpgap in a disposable VM.
-- Anything at all during dependency installation, which happens *outside* the sandbox with
-  `--ignore-scripts`. That flag stops lifecycle scripts from running; it is not a sandbox.
+- Dependency resolution and download, which happens *outside* the sandbox with `--ignore-scripts`.
+  That flag stops lifecycle scripts from running during the download; it is not a sandbox. The
+  hooks themselves are executed later, inside the sandbox — see below.
 
 ## Supply chain of mcpgap itself
 

@@ -25,6 +25,7 @@ from collections.abc import Iterator
 from typing import Any
 
 from mcpgap.model import (
+    INSTALL_PREFIX,
     Attribution,
     DiffReport,
     Finding,
@@ -172,6 +173,37 @@ def diff_versions(
     old_schemas = _schemas(old)
     new_schemas = _schemas(new)
 
+    install_verdicts: dict[str, Verdict] = {}
+    for key in sorted(set(old.install_observations) | set(new.install_observations)):
+        old_script = old.install_observations.get(key)
+        new_script = new.install_observations.get(key)
+        label = f"{INSTALL_PREFIX}{key}"
+
+        if f"{INSTALL_PREFIX}{key}" in (old.unstable_tools | new.unstable_tools):
+            install_verdicts[key] = Verdict.UNSTABLE
+            continue
+        if old_script is None or new_script is None:
+            # A hook present in only one version is a change in the declared
+            # install surface, reported below as scripts_added/removed. There is
+            # nothing to compare behaviourally.
+            install_verdicts[key] = Verdict.CANNOT_CONCLUDE
+            continue
+        if not old_script.exercised or not new_script.exercised:
+            install_verdicts[key] = Verdict.CANNOT_CONCLUDE
+            continue
+
+        script_findings = list(
+            _diff_tool(label, old_script.requests, new_script.requests, set(), config_tokens)
+        )
+        script_findings += list(_diff_side_effects(label, old_script, new_script, set()))
+        findings.extend(script_findings)
+        install_verdicts[key] = (
+            Verdict.UNDECLARED_BEHAVIOUR if script_findings else Verdict.CONSISTENT
+        )
+
+    old_commands = old.declared_scripts
+    new_commands = new.declared_scripts
+
     return DiffReport(
         package=new.package,
         old_version=old.version,
@@ -187,6 +219,14 @@ def diff_versions(
         ),
         destinations_added=new.destinations() - old.destinations(),
         destinations_removed=old.destinations() - new.destinations(),
+        install_verdicts=install_verdicts,
+        scripts_added=frozenset(new_commands) - frozenset(old_commands),
+        scripts_removed=frozenset(old_commands) - frozenset(new_commands),
+        scripts_changed=frozenset(
+            key
+            for key in set(old_commands) & set(new_commands)
+            if old_commands[key] != new_commands[key]
+        ),
     )
 
 

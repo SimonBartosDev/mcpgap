@@ -13,6 +13,10 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+# Findings from lifecycle scripts are tagged with this prefix so they can be
+# told apart from tool findings without inspecting anything else.
+INSTALL_PREFIX = "install:"
+
 
 class Verdict(StrEnum):
     """Per-tool conclusion.
@@ -158,6 +162,11 @@ class VersionObservation:
     # observed values back to them by exact matching rather than by guessing.
     probe_arguments: dict[str, dict[str, Any]] = field(default_factory=dict)
     config_values: dict[str, str] = field(default_factory=dict)
+    # Install-time surface. `declared_scripts` maps "<package>:<hook>" to the
+    # command text -- the install-script equivalent of a tool's schema --
+    # and `install_observations` records what running it actually did.
+    declared_scripts: dict[str, str] = field(default_factory=dict)
+    install_observations: dict[str, ToolObservation] = field(default_factory=dict)
 
     @property
     def not_exercised(self) -> frozenset[str]:
@@ -230,9 +239,20 @@ class DiffReport:
     declared_schema_changed: frozenset[str] = frozenset()
     destinations_added: frozenset[str] = frozenset()
     destinations_removed: frozenset[str] = frozenset()
+    # Install scripts are kept in their own verdict map rather than mixed into
+    # `verdicts`. They are not tools, and letting them into the denominator of
+    # a per-tool rate would quietly change what that rate means.
+    install_verdicts: dict[str, Verdict] = field(default_factory=dict)
+    scripts_added: frozenset[str] = frozenset()
+    scripts_removed: frozenset[str] = frozenset()
+    scripts_changed: frozenset[str] = frozenset()
 
     def findings_for(self, tool: str) -> tuple[Finding, ...]:
         return tuple(f for f in self.findings if f.tool == tool)
+
+    def install_findings(self) -> tuple[Finding, ...]:
+        """Findings produced by lifecycle scripts rather than by tool calls."""
+        return tuple(f for f in self.findings if f.tool.startswith(INSTALL_PREFIX))
 
     @property
     def concluded_tools(self) -> dict[str, Verdict]:
@@ -246,4 +266,5 @@ class DiffReport:
             name: v
             for name, v in self.verdicts.items()
             if v in (Verdict.CONSISTENT, Verdict.UNDECLARED_BEHAVIOUR)
+            and not name.startswith(INSTALL_PREFIX)
         }

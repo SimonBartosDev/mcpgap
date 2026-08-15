@@ -16,6 +16,7 @@ import contextlib
 import socket
 import ssl
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -107,6 +108,7 @@ class SealedProxy:
         self.ca = EphemeralCA(workdir)
         self.ca_bundle = self.ca.write_ca_bundle()
         self._requests: list[ObservedRequest] = []
+        self._active = 0
         self._lock = threading.Lock()
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -133,6 +135,36 @@ class SealedProxy:
         with self._lock:
             return tuple(self._requests)
 
+    def wait_idle(self, timeout: float = 5.0, settle: float = 0.05) -> bool:
+        """Block until no connection is mid-flight and no new one has arrived.
+
+        Connections are handled on their own threads, so a request can still be
+        being parsed at the instant the child process exits. Reading `requests`
+        straight after a process ends therefore sometimes misses the last one --
+        which showed up as a tool disagreeing with itself across runs, since a
+        fire-and-forget request is recorded on some runs and not others.
+
+        Returns False if it gave up waiting, so the caller can treat an
+        unquiesced proxy as an incomplete observation rather than a clean one.
+        """
+        deadline = time.monotonic() + timeout
+        stable_since: float | None = None
+        last_count = -1
+        while time.monotonic() < deadline:
+            with self._lock:
+                active = self._active
+                count = len(self._requests)
+            if active == 0 and count == last_count:
+                if stable_since is None:
+                    stable_since = time.monotonic()
+                elif time.monotonic() - stable_since >= settle:
+                    return True
+            else:
+                stable_since = None
+                last_count = count
+            time.sleep(0.01)
+        return False
+
     def clear(self) -> None:
         with self._lock:
             self._requests.clear()
@@ -150,6 +182,8 @@ class SealedProxy:
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
     def _handle(self, conn: socket.socket) -> None:
+        with self._lock:
+            self._active += 1
         try:
             conn.settimeout(30)
             request, _ = _parse_request(conn)
@@ -166,6 +200,8 @@ class SealedProxy:
         finally:
             with contextlib.suppress(OSError):
                 conn.close()
+            with self._lock:
+                self._active -= 1
 
     def _handle_connect(self, conn: socket.socket, authority: str) -> None:
         host, _, port_text = authority.partition(":")

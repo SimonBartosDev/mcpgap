@@ -2,10 +2,13 @@
 
 Install and run are separate phases with different privileges:
 
-* **Install** happens *outside* the sandbox, with network, using
-  `npm install --ignore-scripts`. `--ignore-scripts` stops lifecycle scripts
-  executing -- but it is not a sandbox, and it means install-time behaviour is
-  a class of attack we do not observe at all. The README says so plainly.
+* **Resolve and download** happens *outside* the sandbox, with network, using
+  `npm install --ignore-scripts`. That fetches the dependency tree without
+  executing any of it.
+* **Lifecycle scripts** then run *inside* the sandbox, before the server
+  starts, exactly as npm would order them -- but confined, with the recording
+  proxy as the only egress. This is the only code mcpgap runs that no tool call
+  asked for, which is why it runs under the strictest conditions available.
 * **Run** happens inside the sandbox with no network but the recording proxy.
 
 Each version is run `runs` times. One observation is not a measurement: tools
@@ -22,8 +25,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from mcpgap.installscripts import InstallScript, declared_scripts, enumerate_install_scripts
 from mcpgap.mcpclient import HandshakeError, McpError, StdioMcpClient
 from mcpgap.model import (
+    INSTALL_PREFIX,
     FileChanges,
     FileEvent,
     ObservedRequest,
@@ -106,6 +111,7 @@ class RunResult:
     declared_tools: dict[str, dict[str, Any]]
     per_tool: dict[str, ToolObservation]
     arguments: dict[str, dict[str, Any]]
+    install: dict[str, ToolObservation]
 
 
 def _request_key(request: ObservedRequest, log: SuppressionLog | None = None) -> str:
@@ -176,6 +182,34 @@ def _relativise(text: str, workdir: Path) -> str:
     return text
 
 
+def _normalise_request(request: ObservedRequest, workdir: Path) -> ObservedRequest:
+    """Strip run-specific paths out of a recorded request.
+
+    Packages echo their working directory into request bodies -- an install
+    script reporting `cwd`, for instance. Since every run and every version gets
+    a fresh temporary directory, an un-normalised body differs on every single
+    run, which marks the tool UNSTABLE and, worse, makes the version diff report
+    a change that is purely an artefact of where we happened to stage the files.
+
+    This is the same defect as `_relativise` was introduced to fix for file and
+    process events; the network channel needs it too. All three channels are
+    normalised here so a future one is not forgotten in isolation.
+    """
+    body = request.body
+    if body is not None:
+        body = _relativise(body.decode("utf-8", "surrogateescape"), workdir).encode(
+            "utf-8", "surrogateescape"
+        )
+    return ObservedRequest(
+        host=request.host,
+        port=request.port,
+        method=request.method,
+        path=_relativise(request.path, workdir),
+        headers={k: _relativise(v, workdir) for k, v in request.headers.items()},
+        body=body,
+    )
+
+
 def _normalise_events(
     files: list[FileEvent], procs: list[ProcessEvent], workdir: Path
 ) -> tuple[tuple[FileEvent, ...], tuple[ProcessEvent, ...]]:
@@ -200,6 +234,87 @@ def _observation_key(observation: ToolObservation) -> str:
         },
         sort_keys=True,
     )
+
+
+def _run_install_scripts(
+    scripts: list[InstallScript],
+    *,
+    staged: Path,
+    workdir: Path,
+    sandbox: SeatbeltSandbox,
+    node: Path,
+    package_root: Path,
+    base_env: dict[str, str],
+    events_log: Path,
+    proxy: SealedProxy,
+    cursor: int,
+    timeout: float,
+) -> tuple[dict[str, ToolObservation], int]:
+    """Execute each lifecycle hook inside the sandbox and record what it did.
+
+    This is the only place mcpgap deliberately runs code that has not been
+    asked for by a tool call. It runs confined: no network but the recording
+    proxy, writes limited to the run directory, no ambient credentials, and a
+    timeout. A hook that fails is still an observation -- a script that tried to
+    reach the network and was refused tells us more than one that did not try.
+    """
+    observations: dict[str, ToolObservation] = {}
+    # npm puts the local bin directory on PATH for lifecycle scripts.
+    bin_dir = staged / "node_modules" / ".bin"
+    env = dict(base_env)
+    env["PATH"] = f"{bin_dir}:{node.parent}:{env.get('PATH', '')}"
+
+    for script in scripts:
+        cwd = (staged / script.relative_cwd).resolve()
+        if not cwd.is_dir():
+            continue
+        before_requests = len(proxy.requests)
+        fs_before = snapshot(workdir, skip_dirs=_SNAPSHOT_SKIP)
+
+        # `error` means "we did not get to observe this", not "the script
+        # failed". A hook that exits non-zero ran, and everything it did up to
+        # that point was recorded, so it stays comparable across versions --
+        # in sealed mode a script that tries to reach the network is *expected*
+        # to fail, and treating that as an abstention would discard the most
+        # interesting observation we have.
+        error: str | None = None
+        process = sandbox.spawn(
+            ["/bin/sh", "-c", script.command],
+            cwd=cwd,
+            env=env,
+            workdir=workdir,
+            allow_tcp_port=proxy.port,
+            read_paths=[node.parent.parent, package_root],
+        )
+        try:
+            process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            # Cut short, so what we saw is a prefix of what it does. That is an
+            # incomplete observation and must not be compared as if complete.
+            error = f"timed out after {timeout}s"
+
+        # The child has exited, but a connection it opened may still be being
+        # parsed on a proxy thread. Wait for the proxy to go quiet before
+        # reading, or the last request is recorded on some runs and not others.
+        proxy.wait_idle()
+        raw_files, raw_procs, cursor = read_events(events_log, cursor)
+        file_events, process_events = _normalise_events(raw_files, raw_procs, workdir)
+        created, modified, deleted = diff_snapshots(
+            fs_before, snapshot(workdir, skip_dirs=_SNAPSHOT_SKIP)
+        )
+        observations[script.key] = ToolObservation(
+            tool=f"{INSTALL_PREFIX}{script.key}",
+            requests=tuple(
+                _normalise_request(r, workdir) for r in proxy.requests[before_requests:]
+            ),
+            file_events=file_events,
+            process_events=process_events,
+            file_changes=FileChanges(created, modified, deleted),
+            error=error,
+        )
+    return observations, cursor
 
 
 def _single_run(
@@ -229,6 +344,22 @@ def _single_run(
         # imports of builtins resolve to the patched functions.
         existing = env.get("NODE_OPTIONS", "")
         env["NODE_OPTIONS"] = f"{existing} --require {shim_path(workdir)}".strip()
+
+        # Lifecycle hooks run before the server starts, as npm would run them,
+        # but inside the sandbox rather than outside it.
+        install_observations, event_cursor = _run_install_scripts(
+            enumerate_install_scripts(staged),
+            staged=staged,
+            workdir=workdir,
+            sandbox=sandbox,
+            node=node,
+            package_root=package_root,
+            base_env=env,
+            events_log=events_log,
+            proxy=proxy,
+            cursor=event_cursor,
+            timeout=timeout,
+        )
 
         process = sandbox.spawn(
             [str(node), "index.js"],
@@ -267,6 +398,7 @@ def _single_run(
                     except McpError as retry_exc:
                         error = f"{exc} | required-only retry: {retry_exc}"
 
+                proxy.wait_idle()
                 raw_files, raw_procs, event_cursor = read_events(events_log, event_cursor)
                 file_events, process_events = _normalise_events(raw_files, raw_procs, workdir)
                 fs_after = snapshot(workdir, skip_dirs=_SNAPSHOT_SKIP)
@@ -276,13 +408,13 @@ def _single_run(
                 arguments[name] = args
                 per_tool[name] = ToolObservation(
                     tool=name,
-                    requests=tuple(proxy.requests[before:]),
+                    requests=tuple(_normalise_request(r, workdir) for r in proxy.requests[before:]),
                     file_events=tuple(file_events),
                     process_events=tuple(process_events),
                     file_changes=FileChanges(created, modified, deleted),
                     error=error,
                 )
-            return RunResult(declared, per_tool, arguments)
+            return RunResult(declared, per_tool, arguments, install_observations)
         finally:
             client.close()
 
@@ -332,6 +464,15 @@ def observe_version(
     declared = results[0].declared_tools
     unstable: set[str] = set()
     folded: dict[str, ToolObservation] = {}
+    folded_install: dict[str, ToolObservation] = {}
+
+    for key in results[0].install:
+        keys = [
+            _observation_key(result.install[key]) for result in results if key in result.install
+        ]
+        if len(keys) != len(results) or len(set(keys)) > 1:
+            unstable.add(f"{INSTALL_PREFIX}{key}")
+        folded_install[key] = results[0].install[key]
 
     for name in declared:
         keys = [
@@ -349,6 +490,8 @@ def observe_version(
             observations=folded,
             runs=runs,
             unstable_tools=frozenset(unstable),
+            declared_scripts=declared_scripts(package_root),
+            install_observations=folded_install,
         ),
         results[0].arguments,
     )

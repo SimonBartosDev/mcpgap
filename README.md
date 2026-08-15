@@ -9,8 +9,8 @@ detects undeclared filesystem writes and subprocess spawns against a synthetic f
 run against one real package. Treat it as a demonstration that the method works, not as a tool you
 can point at your dependencies.
 
-Known gaps, all deliberate: macOS only (the sandbox is seatbelt; there is no Linux backend yet), no
-install-script observation, and no CLI beyond `--version`.
+Known gaps, all deliberate: macOS only (the sandbox is seatbelt; there is no Linux backend yet) and
+no CLI beyond `--version`.
 
 ## What this is for
 
@@ -49,8 +49,12 @@ This section is not boilerplate. It is the reason to trust the rest.
 - **A tool we could not exercise is `cannot_conclude`, never "clean".** Silence is not a pass. If we
   could not call a tool, it is excluded from any rate we publish rather than counted against the
   package — counting our own ignorance as the package's fault inflates the accusation.
-- **We do not observe install-time behaviour.** Dependencies are installed with `--ignore-scripts`.
-  Lifecycle-script attacks are a real and common class, and we are blind to all of them.
+- **Install-time behaviour is observed, but only the hooks npm would really run.** Dependencies are
+  downloaded with `--ignore-scripts`, then lifecycle hooks are executed *inside the sandbox* and
+  recorded. Only the hooks npm actually runs are executed: `preinstall`, `install` and `postinstall`
+  for dependencies, plus `prepare` for the root package. A dependency's `prepare` is deliberately
+  skipped — npm does not run it for a registry install, and running it would report commands as
+  package behaviour that no real install would ever execute.
 - **Filesystem writes are observed completely; reads and subprocesses are not.** Writes are found by
   hashing the sandbox's writable tree before and after each tool call. That is complete rather than
   best-effort for a specific reason: the sandbox refuses writes anywhere else, so a write that

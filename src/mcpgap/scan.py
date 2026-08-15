@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from mcpgap.diff import diff_versions
@@ -39,16 +40,10 @@ def scan_package_version(
     )
     config = dict(declared_config(package_root, seed))
     config.update(env or {})
-    return VersionObservation(
-        package=observation.package,
-        version=observation.version,
-        declared_tools=observation.declared_tools,
-        observations=observation.observations,
-        runs=observation.runs,
-        unstable_tools=observation.unstable_tools,
-        probe_arguments=arguments,
-        config_values=config,
-    )
+    # `replace` rather than reconstructing field by field: a hand-written
+    # constructor call silently drops any field added later, which is exactly
+    # how install-script observations went missing the first time.
+    return replace(observation, probe_arguments=arguments, config_values=config)
 
 
 def diff_observations(old: VersionObservation, new: VersionObservation) -> DiffReport:
