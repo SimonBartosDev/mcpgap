@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # linux-sandbox is temporary: the Linux backend cannot be tested on the
+    # macOS development machine, so CI is its only test environment. Removed
+    # when the branch merges.
+    branches: [main, linux-sandbox]
   pull_request:
   schedule:
     # pip-audit and CodeQL are only useful if they run against a moving advisory
