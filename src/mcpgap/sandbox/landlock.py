@@ -67,8 +67,27 @@ _FS_RIGHTS_BY_ABI: tuple[tuple[int, int], ...] = (
 
 _ACCESS_NET_CONNECT_TCP = 1 << 1
 
-# Reads a Node runtime needs that are outside any per-run directory.
-_SYSTEM_READ_PATHS = (
+# Rights that mean something only for a directory. Landlock rejects a rule that
+# grants any of these on a regular file or device node with EINVAL -- which is
+# how `/dev/null` broke the first Linux run, since a plain "read" set that
+# includes READ_DIR is invalid on a character device. Every rule is masked by
+# whether its target is a directory.
+_DIRECTORY_ONLY_RIGHTS = (
+    (1 << 3)  # read_dir
+    | (1 << 4)  # remove_dir
+    | (1 << 5)  # remove_file
+    | (1 << 6)  # make_char
+    | (1 << 7)  # make_dir
+    | (1 << 8)  # make_reg
+    | (1 << 9)  # make_sock
+    | (1 << 10)  # make_fifo
+    | (1 << 11)  # make_block
+    | (1 << 12)  # make_sym
+    | (1 << 13)  # refer
+)
+
+# Directories a Node runtime needs to read, outside any per-run directory.
+_SYSTEM_READ_DIRS = (
     "/usr",
     "/lib",
     "/lib64",
@@ -78,11 +97,17 @@ _SYSTEM_READ_PATHS = (
     "/opt",
     "/proc",
     "/sys/kernel/mm/transparent_hugepage",
+)
+
+# Device nodes the runtime uses. Writable, because a process that cannot write
+# to /dev/null behaves in ways that have nothing to do with the package.
+_SYSTEM_DEV_FILES = (
     "/dev/null",
     "/dev/zero",
     "/dev/urandom",
     "/dev/random",
     "/dev/tty",
+    "/dev/full",
 )
 
 # The helper runs in a fresh interpreter with no access to this package, so it
@@ -202,13 +227,26 @@ class LandlockSandbox:
     ) -> dict:
         abi = landlock_abi()
         handled_fs = _handled_fs(abi)
-        paths: list[tuple[str, int]] = [
-            (_resolve(p), self.READ_ONLY) for p in _SYSTEM_READ_PATHS if Path(p).exists()
-        ]
+        paths: list[tuple[str, int]] = []
+
+        def grant(path: str | Path, access: int) -> None:
+            target = Path(path)
+            if not target.exists():
+                return
+            # Directory-only rights on a file are rejected outright, so mask
+            # them off rather than letting one device node abort the ruleset.
+            if not target.is_dir():
+                access &= ~_DIRECTORY_ONLY_RIGHTS
+            paths.append((_resolve(target), access))
+
+        for directory in _SYSTEM_READ_DIRS:
+            grant(directory, self.READ_ONLY)
+        for device in _SYSTEM_DEV_FILES:
+            grant(device, self.READ_WRITE)
         for extra in read_paths or []:
-            paths.append((_resolve(extra), self.READ_ONLY))
+            grant(extra, self.READ_ONLY)
         # The run directory is the only writable location, mirroring seatbelt.
-        paths.append((_resolve(workdir), self.READ_WRITE))
+        grant(workdir, self.READ_WRITE)
         return {
             "handled_fs": handled_fs,
             "handled_net": _ACCESS_NET_CONNECT_TCP,
