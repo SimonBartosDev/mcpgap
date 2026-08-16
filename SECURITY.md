@@ -46,7 +46,21 @@ produce is treated as evidence of absence. Filesystem *writes* are established i
 hashing the sandbox's writable tree, which the package cannot evade — the sandbox refuses writes
 anywhere else.
 
-**What the sandbox is asserted to prevent**, with a regression test for each:
+Two backends, with **materially different strength**:
+
+| | macOS (seatbelt) | Linux (Landlock) |
+|---|---|---|
+| Filesystem | user namespace denied wholesale | default-deny, narrow allowlist |
+| Outbound TCP | filtered by **address** — proxy on loopback only | filtered by **port** — proxy's port reachable on *any* host |
+| UDP | denied | **not governed at all** |
+
+The Linux gaps are not oversights. Landlock's network support works on ports, not addresses, and it
+has no UDP support. Closing either requires a network namespace, and unprivileged user namespaces
+are restricted by AppArmor on Ubuntu 24.04 — measured, with `bwrap --unshare-net` failing outright —
+so every namespace-based sandbox needs root. If you are scanning something you consider genuinely
+dangerous, prefer the macOS backend or a disposable VM.
+
+**What the sandbox is asserted to prevent**, with a regression test for each on both backends:
 
 - reading anything under `/Users` or `/Volumes` — the whole user namespace, which covers
   `~/.ssh`, `~/.aws`, `~/.npmrc`, `~/.config/gh` and any credential location invented later

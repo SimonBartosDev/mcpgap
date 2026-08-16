@@ -9,8 +9,11 @@ detects undeclared filesystem writes and subprocess spawns against a synthetic f
 run against one real package. Treat it as a demonstration that the method works, not as a tool you
 can point at your dependencies.
 
-Known gaps, all deliberate: macOS only (the sandbox is seatbelt; there is no Linux backend yet) and
-no CLI beyond `--version`.
+Runs on macOS (seatbelt) and Linux (Landlock). All three gates pass on both in CI. **The Linux
+sandbox is weaker than the macOS one** — see "What it cannot tell you" below; it is a real
+difference, not a rounding error.
+
+Known gaps, all deliberate: no CLI beyond `--version`.
 
 ## What this is for
 
@@ -70,6 +73,15 @@ This section is not boilerplate. It is the reason to trust the rest.
 - **Sealed by default.** The sandbox never reaches the real upstream API; the proxy answers with
   canned responses. So we observe what the server *tried* to send, not what a real API would have
   done in reply. A server that changes behaviour based on real responses can hide from us.
+- **The Linux sandbox is weaker than the macOS one, in two specific ways.** macOS seatbelt filters
+  network by *address*, so egress is pinned to the recording proxy on loopback and nothing else.
+  Linux Landlock filters outbound TCP by *port*, so the proxy's port is reachable on any host — and
+  the code under test can read that port straight out of its own `HTTPS_PROXY`. Landlock also does
+  not govern UDP at all, so DNS-based exfiltration is not blocked there. Closing either needs a
+  network namespace, and unprivileged user namespaces are restricted on the hosts this targets, so
+  bubblewrap and every other namespace sandbox is unavailable without root. Both holes are asserted
+  by tests that pin the *current* behaviour, so closing one later fails a test rather than leaving a
+  stale claim in this file.
 - **We only see what crosses the boundary we watch.** Behaviour triggered by conditions we did not
   create — a date, a specific input, a response we did not fake — is not observed, and "not
   observed" is reported as exactly that.

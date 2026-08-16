@@ -2,10 +2,7 @@ name: CI
 
 on:
   push:
-    # linux-sandbox is temporary: the Linux backend cannot be tested on the
-    # macOS development machine, so CI is its only test environment. Removed
-    # when the branch merges.
-    branches: [main, linux-sandbox]
+    branches: [main]
   pull_request:
   schedule:
     # pip-audit and CodeQL are only useful if they run against a moving advisory
@@ -44,9 +41,9 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --all-groups
-      # Linux has no seatbelt backend, so sandbox-marked tests cannot run here.
-      # They are not skipped silently: the `sandbox` job below is a required
-      # check, and it fails if it does not actually execute them.
+      # Hermetic tests only. The sandbox-backed tests run in the `sandbox`
+      # job on both platforms; they are not skipped silently, because that job
+      # fails if it does not actually execute any.
       - run: uv run pytest -v -m "not sandbox and not network"
 
   sandbox:
