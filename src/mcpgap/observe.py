@@ -41,8 +41,8 @@ from mcpgap.observers import diff_snapshots, install_shim, read_events, snapshot
 from mcpgap.observers.events import shim_path
 from mcpgap.probes import DEFAULT_SEED, arguments_for, nonce
 from mcpgap.proxy import SealedProxy
-from mcpgap.sandbox import SeatbeltSandbox
-from mcpgap.sandbox.base import SandboxUnavailable
+from mcpgap.sandbox import default_sandbox
+from mcpgap.sandbox.base import Sandbox
 
 
 class InstallError(RuntimeError):
@@ -241,7 +241,7 @@ def _run_install_scripts(
     *,
     staged: Path,
     workdir: Path,
-    sandbox: SeatbeltSandbox,
+    sandbox: Sandbox,
     node: Path,
     package_root: Path,
     base_env: dict[str, str],
@@ -324,7 +324,7 @@ def _single_run(
     seed: str,
     timeout: float,
 ) -> RunResult:
-    sandbox = SeatbeltSandbox()
+    sandbox = default_sandbox()
     node = _node_binary()
     config = declared_config(package_root, seed)
     staged = _stage_package(package_root, workdir)
@@ -443,11 +443,10 @@ def observe_version(
     Returns the observation and the arguments used, which the differ needs in
     order to attribute values back to the inputs we supplied.
     """
-    sandbox = SeatbeltSandbox()
-    if not sandbox.available():
-        raise SandboxUnavailable(
-            "no sandbox available; refusing to run untrusted package code unconfined"
-        )
+    # Raises SandboxUnavailable if this platform has no backend. There is no
+    # unconfined fallback: running code from strangers unconfined is a
+    # different act, not a degraded mode.
+    default_sandbox()
     install_dependencies(package_root)
 
     results: list[RunResult] = []

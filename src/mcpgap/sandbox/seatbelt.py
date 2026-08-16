@@ -47,16 +47,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from mcpgap.sandbox.base import SandboxUnavailable
+from mcpgap.sandbox.base import SandboxUnavailable, build_child_env
 
 # Trees that hold user data. Denied wholesale rather than enumerated by
 # credential filename, so new secrets are covered without a code change.
 _USER_DATA_TREES = ("/Users", "/Volumes")
-
-# Environment variables that must never reach the child. Anything not built by
-# `child_env` is dropped, so this list is belt-and-braces for callers who pass
-# their own mapping.
-_FORBIDDEN_ENV_PREFIXES = ("AWS_", "GITHUB_", "GH_", "NPM_", "OPENAI_", "ANTHROPIC_")
 
 
 def _resolve(path: str | Path) -> str:
@@ -122,25 +117,8 @@ class SeatbeltSandbox:
         return "\n".join(lines) + "\n"
 
     def child_env(self, workdir: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
-        """Build the child's environment from nothing.
-
-        Started empty rather than filtered from `os.environ`, so a credential we
-        never thought of cannot be inherited. `HOME` and `TMPDIR` point into the
-        working directory -- see footgun 2.
-        """
-        home = workdir / "home"
-        home.mkdir(parents=True, exist_ok=True)
-        env = {
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-            "HOME": str(home),
-            "TMPDIR": str(home),
-            "LANG": "C",
-        }
-        for key, value in (extra or {}).items():
-            if key.startswith(_FORBIDDEN_ENV_PREFIXES):
-                raise ValueError(f"refusing to pass credential-shaped variable {key!r} to sandbox")
-            env[key] = value
-        return env
+        """Shared with the Landlock backend; see `base.build_child_env`."""
+        return build_child_env(workdir, extra)
 
     def spawn(
         self,

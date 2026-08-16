@@ -110,9 +110,11 @@ def main() -> int:
             print(f"could not load libc: {exc}")
 
     header("seccomp")
-    print(f"CONFIG via /proc/self/status Seccomp = {[
-        line for line in read('/proc/self/status').splitlines() if line.startswith('Seccomp')
-    ]}")
+    print(
+        f"CONFIG via /proc/self/status Seccomp = {
+            [line for line in read('/proc/self/status').splitlines() if line.startswith('Seccomp')]
+        }"
+    )
 
     header("node")
     code, out = run(["node", "--version"])

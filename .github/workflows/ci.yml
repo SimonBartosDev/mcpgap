@@ -47,11 +47,18 @@ jobs:
       - run: uv run pytest -v -m "not sandbox and not network"
 
   sandbox:
-    # The acceptance gate runs the real sandbox. If this job is skipped,
-    # cancelled, or its tests are deselected, the gate has NOT been verified.
+    # The acceptance gates run the real sandbox. If this job is skipped,
+    # cancelled, or its tests are deselected, the gates have NOT been verified.
     # `--strict-markers` plus the guard step below make that a failure rather
     # than a green tick.
-    runs-on: macos-latest
+    #
+    # Both backends run the same containment assertions, so neither can quietly
+    # become the weaker one: macOS uses seatbelt, Linux uses Landlock.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
